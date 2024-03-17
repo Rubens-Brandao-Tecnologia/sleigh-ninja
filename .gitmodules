@@ -1,0 +1,3 @@
+[submodule "binaryninja-api"]
+	path = binaryninja-api
+	url = git@github.com:mkrasnitski/binaryninja-api.git

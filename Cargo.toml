@@ -14,7 +14,7 @@ name = "tricore"
 path = "src/bin/tricore.rs"
 
 [dependencies]
-binaryninja = { path = "../binaryninja-api/rust" }
-sleigh-rs = { path = "../sleigh-rs", features=["thread"] }
-sleigh-eval = { path = "../sleigh-eval" }
+binaryninja = { path = "binaryninja-api/rust" }
+sleigh-rs = { git = "https://github.com/rbran/sleigh-rs", features=["thread"] }
+sleigh-eval = { git = "https://github.com/rbran/sleigh-eval" }
 arrayvec = "0.7.4"
