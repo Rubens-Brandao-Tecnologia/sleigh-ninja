@@ -5,6 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "x86_64"
+path = "src/bin/x86_64.rs"
+
+[[bin]]
+name = "tricore"
+path = "src/bin/tricore.rs"
+
 [dependencies]
 binaryninja = { path = "../binaryninja-api/rust" }
 sleigh-rs = { path = "../sleigh-rs", features=["thread"] }

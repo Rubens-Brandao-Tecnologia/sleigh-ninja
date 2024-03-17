@@ -1,4 +1,5 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::sync::Arc;
 
 use binaryninja::architecture::{CoreArchitecture, CustomArchitectureHandle};
 use sleigh_eval::new_default_context;
