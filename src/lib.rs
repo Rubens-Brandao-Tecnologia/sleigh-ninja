@@ -1,43 +1,46 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use arrayvec::ArrayString;
 
 use binaryninja::architecture::{
-    Architecture, CoreArchitecture, Flag, FlagClass, FlagCondition, FlagGroup, FlagRole, FlagWrite,
-    ImplicitRegisterExtend, InstructionInfo, Intrinsic, Register, RegisterInfo, RegisterStack,
-    RegisterStackInfo, CustomArchitectureHandle,
+    Architecture, CoreArchitecture, CustomArchitectureHandle, Flag, FlagClass, FlagCondition,
+    FlagGroup, FlagRole, FlagWrite, ImplicitRegisterExtend, InstructionInfo, Intrinsic, Register,
+    RegisterInfo, RegisterStack, RegisterStackInfo,
 };
 use binaryninja::disassembly::{InstructionTextToken, InstructionTextTokenContents};
 use binaryninja::llil::Lifter;
 use binaryninja::rc::Ref;
-use binaryninja::string::BnString;
 use binaryninja::types::{Conf, NameAndType, Type};
 use binaryninja::Endianness;
 
 use sleigh_eval::*;
 use sleigh_rs::space::SpaceType;
-use sleigh_rs::varnode::Varnode;
 use sleigh_rs::{NumberNonZeroUnsigned, Sleigh, VarnodeId};
 
-const MAX_NAME_SIZE: usize = 128;
-
-pub struct SleighArch(pub Arc<SleighArchInner>);
-
 #[derive(Clone)]
-pub struct SleighArchInner {
+pub struct SleighArch {
     pub core: CoreArchitecture,
     pub handle: CustomArchitectureHandle<SleighArch>,
-    pub sleigh: Sleigh,
-    pub context: Vec<u8>,
+    pub sleigh: &'static Sleigh,
+    pub default_context: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
 pub struct SleighRegister {
-    name: ArrayString<MAX_NAME_SIZE>,
-    info: SleighRegisterInfo,
+    sleigh: &'static Sleigh,
     id: VarnodeId,
+}
+
+impl PartialEq for SleighRegister {
+    fn eq(&self, other: &Self) -> bool {
+        self.sleigh as *const _ as usize == other.sleigh as *const _ as usize && self.id == other.id
+    }
+}
+impl Eq for SleighRegister {}
+impl core::hash::Hash for SleighRegister {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.sleigh as *const _ as usize).hash(state);
+        self.id.hash(state);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +55,7 @@ pub struct SleighRegisterStack {}
 #[derive(Clone, Copy)]
 pub struct SleighRegisterStackInfo {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SleighFlag {}
 
 #[derive(Clone, Copy)]
@@ -66,28 +69,8 @@ pub struct SleighFlagGroup {}
 
 #[derive(Clone, Copy)]
 pub struct SleighIntrinsic {
-    name: ArrayString<MAX_NAME_SIZE>,
+    _sleigh: &'static SleighArch,
     id: sleigh_rs::UserFunctionId,
-}
-
-impl AsRef<SleighArchInner> for SleighArch {
-    fn as_ref(&self) -> &SleighArchInner {
-        self.0.as_ref()
-    }
-}
-
-impl std::ops::Deref for SleighArch {
-    type Target = SleighArchInner;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
-impl Clone for SleighArch {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
 }
 
 impl Architecture for SleighArch {
@@ -151,14 +134,11 @@ impl Architecture for SleighArch {
         data: &[u8],
         addr: u64,
     ) -> Option<(usize, Vec<InstructionTextToken>)> {
-        let mut context = self.context.clone();
+        let mut context = self.default_context.clone();
         let instruction = match_instruction(&self.sleigh, &mut context, addr, data)?;
         // TODO convert the display segment directly into InstructionTextTokenContents
         let disassembly = to_string_instruction(&self.sleigh, &context, addr, &instruction);
-        let output = InstructionTextToken::new(
-            BnString::new(disassembly),
-            InstructionTextTokenContents::Text,
-        );
+        let output = InstructionTextToken::new(&disassembly, InstructionTextTokenContents::Text);
         Some((instruction.instruction.len, vec![output]))
     }
 
@@ -187,7 +167,7 @@ impl Architecture for SleighArch {
             .iter()
             .enumerate()
             .filter(|(_id, varnode)| varnode.space.0 == space_id)
-            .map(|(id, varnode)| SleighRegister::from_sleigh(VarnodeId(id), varnode))
+            .map(|(id, _varnode)| SleighRegister::from_sleigh(self.sleigh, VarnodeId(id)))
             .collect()
     }
 
@@ -202,12 +182,11 @@ impl Architecture for SleighArch {
 
     fn register_from_id(&self, id: u32) -> Option<Self::Register> {
         let id = VarnodeId(id.try_into().unwrap());
-        let varnode = self.sleigh.varnode(id);
-        Some(SleighRegister::from_sleigh(id, varnode))
+        Some(SleighRegister::from_sleigh(self.sleigh, id))
     }
 
     fn handle(&self) -> Self::Handle {
-        self.0.handle
+        self.handle
     }
 }
 
@@ -218,16 +197,8 @@ impl AsRef<CoreArchitecture> for SleighArch {
 }
 
 impl SleighRegister {
-    fn from_sleigh(id: VarnodeId, varnode: &Varnode) -> Self {
-        let info = SleighRegisterInfo {
-            size: varnode.len_bytes,
-            offset: varnode.address,
-        };
-        SleighRegister {
-            id,
-            info,
-            name: varnode.name().try_into().unwrap(),
-        }
+    fn from_sleigh(inner: &'static Sleigh, id: VarnodeId) -> Self {
+        SleighRegister { sleigh: inner, id }
     }
 }
 
@@ -235,15 +206,23 @@ impl Register for SleighRegister {
     type InfoType = SleighRegisterInfo;
 
     fn name(&self) -> Cow<str> {
-        Cow::Borrowed(&self.name)
+        let varnode = self.sleigh.varnode(self.id);
+        Cow::Borrowed(varnode.name())
     }
 
     fn info(&self) -> Self::InfoType {
-        self.info
+        let varnode = self.sleigh.varnode(self.id);
+        SleighRegisterInfo {
+            size: varnode.len_bytes,
+            offset: varnode.address,
+        }
     }
 
     fn id(&self) -> u32 {
-        self.id.0.try_into().unwrap()
+        if !(0..=0x7fff_ffff).contains(&self.id.0) {
+            todo!();
+        }
+        self.id.0 as u32
     }
 }
 
@@ -285,6 +264,7 @@ impl RegisterStack for SleighRegisterStack {
     }
 
     fn id(&self) -> u32 {
+        // MUST be in the range [0, 0x7fff_ffff]
         todo!()
     }
 }
@@ -319,6 +299,7 @@ impl Flag for SleighFlag {
     }
 
     fn id(&self) -> u32 {
+        // MUST be in the range [0, 0x7fff_ffff]
         todo!()
     }
 }
@@ -336,6 +317,7 @@ impl FlagWrite for SleighFlagWrite {
     }
 
     fn id(&self) -> u32 {
+        // MUST NOT be 0. MUST be in the range [1, 0x7fff_ffff]
         todo!()
     }
 
@@ -349,6 +331,7 @@ impl FlagClass for SleighFlagClass {
         todo!()
     }
     fn id(&self) -> u32 {
+        // MUST NOT be 0. MUST be in the range [1, 0x7fff_ffff]
         todo!()
     }
 }
@@ -362,6 +345,7 @@ impl FlagGroup for SleighFlagGroup {
     }
 
     fn id(&self) -> u32 {
+        // MUST be in the range [0, 0x7fff_ffff]
         todo!()
     }
 
@@ -376,14 +360,14 @@ impl FlagGroup for SleighFlagGroup {
 
 impl Intrinsic for SleighIntrinsic {
     fn name(&self) -> Cow<str> {
-        Cow::Borrowed(&self.name)
+        Cow::Owned(format!("intrinsic_{}", self.id.0))
     }
 
     fn id(&self) -> u32 {
         self.id.0.try_into().unwrap()
     }
 
-    fn inputs(&self) -> Vec<NameAndType<String>> {
+    fn inputs(&self) -> Vec<Ref<NameAndType>> {
         // TODO identify number of parameters, also solve functions that allow
         // variable number of parameters
         vec![]

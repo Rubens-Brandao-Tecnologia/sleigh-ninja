@@ -1,9 +1,8 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use binaryninja::architecture::{CoreArchitecture, CustomArchitectureHandle};
 use sleigh_eval::new_default_context;
-use sleigh_ninja::{SleighArch, SleighArchInner};
+use sleigh_ninja::SleighArch;
 
 fn main() {
     let _handle = binaryninja::architecture::register_architecture("sleigh-tricore", register_arch);
@@ -21,11 +20,11 @@ fn register_arch(
         Ok(data) => data,
         Err(e) => panic!("Error: {e}"),
     };
-    let context = new_default_context(&sleigh);
-    SleighArch(Arc::new(SleighArchInner {
-        context,
-        sleigh,
+    let default_context = new_default_context(&sleigh);
+    SleighArch {
+        default_context,
+        sleigh: Box::leak(Box::new(sleigh)),
         core,
         handle,
-    }))
+    }
 }

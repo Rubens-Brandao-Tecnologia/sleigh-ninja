@@ -1,9 +1,8 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use binaryninja::architecture::{CoreArchitecture, CustomArchitectureHandle};
 use sleigh_eval::new_default_context;
-use sleigh_ninja::{SleighArch, SleighArchInner};
+use sleigh_ninja::SleighArch;
 use sleigh_rs::ContextId;
 
 fn main() {
@@ -22,10 +21,10 @@ fn register_arch(
         Ok(data) => data,
         Err(e) => panic!("Error: {e}"),
     };
-    let mut context = new_default_context(&sleigh);
+    let mut default_context = new_default_context(&sleigh);
     sleigh_eval::set_context_field_value(
         &sleigh,
-        &mut context,
+        &mut default_context,
         sleigh
             .contexts()
             .iter()
@@ -36,7 +35,7 @@ fn register_arch(
     );
     sleigh_eval::set_context_field_value(
         &sleigh,
-        &mut context,
+        &mut default_context,
         sleigh
             .contexts()
             .iter()
@@ -45,10 +44,10 @@ fn register_arch(
             .unwrap(),
         1,
     );
-    SleighArch(Arc::new(SleighArchInner {
-        context,
-        sleigh,
+    SleighArch {
+        default_context,
+        sleigh: Box::leak(Box::new(sleigh)),
         core,
         handle,
-    }))
+    }
 }
