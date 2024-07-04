@@ -304,7 +304,6 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sleigh-eval"
 version = "0.1.0"
-source = "git+https://github.com/rbran/sleigh-eval#9e50c484754a3cc366683014dc3faa67f7668d2e"
 dependencies = [
  "sleigh-rs",
  "tracing",
@@ -323,7 +322,6 @@ dependencies = [
 [[package]]
 name = "sleigh-rs"
 version = "0.1.5"
-source = "git+https://github.com/rbran/sleigh-rs#abd0aa6be40013d8614f0156137277aadaf75b54"
 dependencies = [
  "nom",
  "thiserror",

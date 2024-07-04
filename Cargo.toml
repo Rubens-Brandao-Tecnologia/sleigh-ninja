@@ -5,15 +5,18 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[bin]]
-name = "x86_64"
-path = "src/bin/x86_64.rs"
-
-[[bin]]
-name = "tricore"
-path = "src/bin/tricore.rs"
-
 [dependencies]
-binaryninja = { path = "binaryninja-api/rust" }
-sleigh-rs = { git = "https://github.com/rbran/sleigh-rs", features=["thread"] }
-sleigh-eval = { git = "https://github.com/rbran/sleigh-eval" }
+binaryninja = { path = "../binaryninja-api/rust" }
+sleigh-eval = { path = "../sleigh-eval" }
+# we don't need this directly, sleigh-eval exports this,
+# we just need to force the thread feature
+sleigh-rs = { path = "../sleigh-rs", features = ["thread"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+debug = 1
+

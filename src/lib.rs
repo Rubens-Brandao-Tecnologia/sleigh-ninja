@@ -1,16 +1,18 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 
 use binaryninja::architecture::{
     Architecture, CoreArchitecture, CustomArchitectureHandle, Flag, FlagClass, FlagCondition,
     FlagGroup, FlagRole, FlagWrite, ImplicitRegisterExtend, InstructionInfo, Intrinsic, Register,
     RegisterInfo, RegisterStack, RegisterStackInfo,
 };
+use binaryninja::custombinaryview::{BinaryViewType, BinaryViewTypeExt};
 use binaryninja::disassembly::{InstructionTextToken, InstructionTextTokenContents};
-use binaryninja::llil::{self, Lifter};
 use binaryninja::rc::Ref;
 use binaryninja::types::{Conf, NameAndType, Type};
 use binaryninja::Endianness;
+use binaryninja::{add_optional_plugin_dependency, llil};
 
 use sleigh_eval::sleigh_rs::{NumberNonZeroUnsigned, Sleigh, VarnodeId};
 use sleigh_eval::*;
@@ -123,16 +125,22 @@ impl Architecture for SleighArch {
     }
 
     fn opcode_display_len(&self) -> usize {
-        todo!()
+        // TODO is this exacly?
+        self.max_instr_len()
     }
 
     fn associated_arch_by_addr(&self, _addr: &mut u64) -> CoreArchitecture {
-        todo!()
+        self.core
     }
 
-    fn instruction_info(&self, _data: &[u8], _addr: u64) -> Option<InstructionInfo> {
-        // TODO extract this information from sleigh execution
-        None
+    fn instruction_info(&self, data: &[u8], addr: u64) -> Option<InstructionInfo> {
+        let instruction =
+            match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
+        let execution = sleigh_eval::to_execution_instruction(&self.sleigh, addr, &instruction)?;
+        Some(InstructionInfo::new(
+            instruction.constructor.len,
+            execution.delay_slot.try_into().unwrap(),
+        ))
     }
 
     fn instruction_text(
@@ -152,125 +160,142 @@ impl Architecture for SleighArch {
         &self,
         data: &[u8],
         addr: u64,
-        il: &mut Lifter<Self>,
+        il: &mut llil::Lifter<Self>,
     ) -> Option<(usize, bool)> {
         let instruction =
             match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
         let execution = sleigh_eval::to_execution_instruction(&self.sleigh, addr, &instruction)?;
 
-        // create all the labels for blocks
-        let mut map_label: Option<HashMap<BlockId, llil::Label>> = (execution.blocks.len() > 1)
-            .then(|| {
-                execution
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(id, _block)| (BlockId(id), llil::Label::default()))
-                    .collect()
-            });
-        for (block_id, block) in execution.blocks.iter().enumerate() {
-            if let Some(map_label) = &mut map_label {
-                il.mark_label(map_label.get_mut(&BlockId(block_id)).unwrap());
-            }
-            for instr in &block.statements {
-                match instr {
-                    Statement::CpuBranch(branch) => {
-                        let dst = ExecutionContext {
+        // TODO handle context changes and GlobalSet
+
+        // TODO for now only implement direct blocks
+        if execution.blocks.len() > 1 {
+            return None;
+        }
+
+        for instr in execution.blocks.iter().flat_map(|b| &b.statements) {
+            match instr {
+                Statement::CpuBranch(branch) => {
+                    let dst = ExecutionContext {
+                        sleigh: &self.sleigh,
+                        execution: &execution,
+                        expr: &branch.dst,
+                    };
+                    let add_call = || match branch.call {
+                        sleigh_rs::execution::BranchCall::Goto => il.jump(dst).append(),
+                        sleigh_rs::execution::BranchCall::Call => il.call(dst).append(),
+                        sleigh_rs::execution::BranchCall::Return => il.ret(dst).append(),
+                    };
+                    if let Some(cond) = &branch.cond {
+                        let cond = ExecutionContext {
                             sleigh: &self.sleigh,
                             execution: &execution,
-                            expr: &branch.dst,
+                            expr: cond,
                         };
-                        let add_call = || match branch.call {
-                            sleigh_rs::execution::BranchCall::Goto => il.jump(dst).append(),
-                            sleigh_rs::execution::BranchCall::Call => il.call(dst).append(),
-                            sleigh_rs::execution::BranchCall::Return => il.ret(dst).append(),
-                        };
-                        if let Some(cond) = &branch.cond {
-                            let cond = ExecutionContext {
-                                sleigh: &self.sleigh,
-                                execution: &execution,
-                                expr: cond,
-                            };
-                            assert!(il.label_for_address(addr).is_none());
-                            let next_insts =
-                                addr + u64::try_from(instruction.constructor.len).unwrap();
-                            assert!(il.label_for_address(next_insts).is_none());
-                            let mut tl = llil::Label::default();
-                            il.mark_label(&mut tl);
-                            add_call();
-                            let mut fl = llil::Label::default();
-                            il.if_expr(cond, &tl, &fl).append();
-                            il.mark_label(&mut fl);
-                        } else {
-                            add_call()
-                        }
+                        assert!(il.label_for_address(addr).is_none());
+                        let next_insts = addr + u64::try_from(instruction.constructor.len).unwrap();
+                        assert!(il.label_for_address(next_insts).is_none());
+                        let mut tl = llil::Label::default();
+                        il.mark_label(&mut tl);
+                        add_call();
+                        let mut fl = llil::Label::default();
+                        il.if_expr(cond, &tl, &fl).append();
+                        il.mark_label(&mut fl);
+                    } else {
+                        add_call()
                     }
-                    Statement::LocalGoto(goto) => {
-                        let label = map_label.as_mut().unwrap().get(&goto.dst).unwrap();
-                        il.goto(label);
-                    }
-                    Statement::UserCall(call) => {
-                        il.intrinsic::<'_, SleighRegister, _, _, _, _>(
-                            [],
-                            SleighIntrinsic {
-                                sleigh: self.sleigh,
-                                id: call.function,
-                            },
-                            call.params.iter().map(|p| ExecutionContext {
-                                sleigh: &self.sleigh,
-                                execution: &execution,
-                                expr: p,
-                            }),
-                        )
-                        .append();
-                    }
-                    Statement::Assignment(ass) => {
-                        let expr = ExecutionContext {
+                }
+                Statement::LocalGoto(_goto) => {
+                    unreachable!("Local goto should not exist in single block execution");
+                }
+                Statement::UserCall(call) => {
+                    il.intrinsic::<'_, SleighRegister, _, _, _, _>(
+                        [],
+                        SleighIntrinsic {
+                            sleigh: self.sleigh,
+                            id: call.function,
+                        },
+                        call.params.iter().map(|p| ExecutionContext {
                             sleigh: &self.sleigh,
                             execution: &execution,
-                            expr: &ass.right,
-                        };
-                        match ass.var {
-                            WriteValue::Varnode(varnode_id) => {
-                                let varnode = self.sleigh.varnode(varnode_id);
-                                il.set_reg(
-                                    varnode.len_bytes.get().try_into().unwrap(),
-                                    llil::Register::ArchReg(SleighRegister {
-                                        sleigh: self.sleigh,
-                                        id: varnode_id,
-                                    }),
-                                    expr,
-                                )
-                                .append();
-                            }
-                            WriteValue::Variable(variable_id) => {
-                                let varnode = execution.variable(variable_id);
-                                il.set_reg(
-                                    ((varnode.len_bits.get() + 7) / 8).try_into().unwrap(),
-                                    llil::Register::Temp(variable_id.0.try_into().unwrap()),
-                                    expr,
-                                )
-                                .append();
-                            }
-                            WriteValue::Bitrange(_) => todo!(),
+                            expr: p,
+                        }),
+                    )
+                    .append();
+                }
+                Statement::Assignment(ass) => {
+                    let expr = ExecutionContext {
+                        sleigh: &self.sleigh,
+                        execution: &execution,
+                        expr: &ass.right,
+                    };
+                    match ass.var {
+                        WriteValue::Varnode(varnode_id) => {
+                            let varnode = self.sleigh.varnode(varnode_id);
+                            il.set_reg(
+                                varnode.len_bytes.get().try_into().unwrap(),
+                                SleighRegister::from_sleigh(self.sleigh, varnode_id),
+                                expr,
+                            )
+                            .append();
+                        }
+                        WriteValue::Variable(variable_id) => {
+                            let varnode = execution.variable(variable_id);
+                            il.set_reg(
+                                ((varnode.len_bits.get() + 7) / 8).try_into().unwrap(),
+                                llil::Register::Temp(variable_id.0.try_into().unwrap()),
+                                expr,
+                            )
+                            .append();
+                        }
+                        WriteValue::Bitrange(bitrange_id) => {
+                            // write only a few bits to the reg,
+                            // eg: varnode = (varnode & !0x1111) | value;
+                            let bitrange = self.sleigh.bitrange(bitrange_id);
+                            let varnode = self.sleigh.varnode(bitrange.varnode);
+                            let varnode_len = varnode.len_bytes.get().try_into().unwrap();
+                            let mask = (u64::MAX
+                                >> (u64::BITS - u32::try_from(bitrange.bits.len().get()).unwrap()))
+                                << bitrange.bits.start();
+                            let left = il.and(
+                                varnode_len,
+                                il.reg(
+                                    varnode_len,
+                                    SleighRegister::from_sleigh(self.sleigh, bitrange.varnode),
+                                ),
+                                il.const_int(
+                                    varnode_len,
+                                    !mask
+                                        & u64::MAX
+                                            >> (u64::BITS
+                                                - u32::try_from(varnode_len * 8).unwrap()),
+                                ),
+                            );
+                            let expr = il.or(varnode_len, left, expr);
+                            il.set_reg(
+                                varnode_len,
+                                SleighRegister::from_sleigh(self.sleigh, bitrange.varnode),
+                                expr,
+                            )
+                            .append();
                         }
                     }
-                    Statement::MemWrite(mem) => {
-                        il.store(
-                            mem.mem.len_bytes.get().try_into().unwrap(),
-                            ExecutionContext {
-                                sleigh: &self.sleigh,
-                                execution: &execution,
-                                expr: &mem.addr,
-                            },
-                            ExecutionContext {
-                                sleigh: &self.sleigh,
-                                execution: &execution,
-                                expr: &mem.right,
-                            },
-                        )
-                        .append();
-                    }
+                }
+                Statement::MemWrite(mem) => {
+                    il.store(
+                        mem.mem.len_bytes.get().try_into().unwrap(),
+                        ExecutionContext {
+                            sleigh: &self.sleigh,
+                            execution: &execution,
+                            expr: &mem.addr,
+                        },
+                        ExecutionContext {
+                            sleigh: &self.sleigh,
+                            execution: &execution,
+                            expr: &mem.right,
+                        },
+                    )
+                    .append();
                 }
             }
         }
@@ -304,10 +329,14 @@ impl Architecture for SleighArch {
     }
 
     fn stack_pointer_reg(&self) -> Option<Self::Register> {
-        todo!()
+        // TODO find with external files?
+        None
     }
 
     fn register_from_id(&self, id: u32) -> Option<Self::Register> {
+        if id >= 0x8000_0000 {
+            return None;
+        }
         let id = VarnodeId(id.try_into().unwrap());
         Some(SleighRegister::from_sleigh(self.sleigh, id))
     }
@@ -324,8 +353,9 @@ impl AsRef<CoreArchitecture> for SleighArch {
 }
 
 impl SleighRegister {
-    fn from_sleigh(inner: &'static Sleigh, id: VarnodeId) -> Self {
-        SleighRegister { sleigh: inner, id }
+    fn from_sleigh(sleigh: &'static Sleigh, id: VarnodeId) -> Self {
+        assert!(id.0 < 0x8000_0000);
+        SleighRegister { sleigh, id }
     }
 }
 
@@ -347,7 +377,7 @@ impl Register for SleighRegister {
 
     fn id(&self) -> u32 {
         if self.id.0 >= 0x8000_0000 {
-            todo!();
+            panic!();
         }
         self.id.0 as u32
     }
@@ -572,11 +602,9 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                 SleighArch,
             >>::lift_with_size(il, ctxt.map(value), bytes),
             Expr::Op(expr) => {
-                let value_bytes = usize::try_from((expr.len_bits.get() + 7) / 8).unwrap();
-                assert_eq!(bytes, value_bytes);
                 let left = ctxt.map(&*expr.left);
                 let right = ctxt.map(&*expr.right);
-                match expr.op {
+                let lifted_expr = match expr.op {
                     Mult => il.mul(bytes, left, right).build(),
                     Div => il.divu(bytes, left, right).build(),
                     SigDiv => il.divs(bytes, left, right).build(),
@@ -615,10 +643,12 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                     Ne => il.cmp_ne(bytes, left, right).build(),
                     FloatEq => il.fcmp_e(bytes, left, right).build(),
                     FloatNe => il.fcmp_ne(bytes, left, right).build(),
-                    Carry => todo!(),
-                    SCarry => todo!(),
-                    SBorrow => todo!(),
-                }
+                    // TODO unimplemented for now
+                    Carry => il.unimplemented(),
+                    SCarry => il.unimplemented(),
+                    SBorrow => il.unimplemented(),
+                };
+                cut_bits(lifted_expr, il, expr.len_bits.get().try_into().unwrap(), bytes)
             }
         }
     }
@@ -676,18 +706,12 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                 let size = usize::try_from((expr_op.output_bits.get() + 7) / 8).unwrap();
                 let expr =
                     llil::LiftableWithSize::lift_with_size(il, ctxt.map(&*expr_op.input), size);
-                match &expr_op.op {
+                let lifted_expr = match &expr_op.op {
                     TakeLsb(bytes) => il.low_part(bytes.get().try_into().unwrap(), expr).build(),
                     TrunkLsb(trunk) => ctxt.trunk_lsb(il, expr, *trunk, size, bytes),
-                    BitRange(bits) => ctxt.bitrange(
-                        il,
-                        expr,
-                        usize::try_from(bits.start - bits.end).unwrap(),
-                        size,
-                        bytes,
-                    ),
+                    BitRange(bits) => ctxt.bitrange(il, expr, bits.start, bits.end, size, bytes),
                     Dereference(mem) => {
-                        // TODO check if it's names RAM
+                        // TODO check if it's named RAM
                         if ctxt.sleigh.space(mem.space).space_type
                             != sleigh_rs::space::SpaceType::Ram
                         {
@@ -700,20 +724,26 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                     BitNegation => il.not(size, expr).build(),
                     Negative => il.neg(size, expr).build(),
                     FloatNegative => il.fneg(size, expr).build(),
-                    Popcount => todo!(),
-                    Lzcount => todo!(),
                     Zext => il.zx(size, expr).build(),
                     Sext => il.sx(size, expr).build(),
-                    FloatNan => todo!(),
                     FloatAbs => il.fabs(size, expr).build(),
                     FloatSqrt => il.fsqrt(size, expr).build(),
                     Int2Float => il.int_to_float(size, expr).build(),
-                    Float2Float => todo!(),
-                    SignTrunc => todo!(),
                     FloatCeil => il.ceil(size, expr).build(),
                     FloatFloor => il.floor(size, expr).build(),
-                    FloatRound => todo!(),
-                }
+                    FloatNan => il.unimplemented(),
+                    Float2Float => il.unimplemented(),
+                    SignTrunc => il.unimplemented(),
+                    FloatRound => il.unimplemented(),
+                    Popcount => il.unimplemented(),
+                    Lzcount => il.unimplemented(),
+                };
+                cut_bits(
+                    lifted_expr,
+                    il,
+                    expr_op.output_bits.get().try_into().unwrap(),
+                    bytes,
+                )
             }
         }
     }
@@ -812,13 +842,7 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
         let varnode = self.sleigh.varnode(varnode_id);
         let varnode_bytes = usize::try_from(varnode.len_bytes.get()).unwrap();
         assert_eq!(varnode_bytes, bytes);
-        il.reg(
-            bytes,
-            SleighRegister {
-                sleigh: self.sleigh,
-                id: varnode_id,
-            },
-        )
+        il.reg(bytes, SleighRegister::from_sleigh(self.sleigh, varnode_id))
     }
 
     fn read_variable(
@@ -866,9 +890,9 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
         let bitrange = self.sleigh.bitrange(bitrange_id);
 
         let bits = usize::try_from(bits).unwrap();
-        let bitrange_bits = usize::try_from(bitrange.bits.len().get()).unwrap();
+        let bitrange_len = usize::try_from(bitrange.bits.len().get()).unwrap();
 
-        assert!(bits >= bitrange_bits);
+        assert!(bits >= bitrange_len);
         assert!(bytes * 8 >= bits);
 
         let varnode = self.sleigh.varnode(bitrange.varnode);
@@ -876,7 +900,14 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
         let expr = self.read_varnode(il, bitrange.varnode, varnode_bytes);
 
         // truncate the varnode into the bitrange
-        self.bitrange(il, expr, bitrange_bits, varnode_bytes, bytes)
+        self.bitrange(
+            il,
+            expr,
+            bitrange.bits.start(),
+            bitrange.bits.end().get(),
+            varnode_bytes,
+            bytes,
+        )
     }
 
     fn trunk_lsb(
@@ -934,7 +965,8 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
             llil::NonSSA<llil::LiftedNonSSA>,
             llil::ValueExpr,
         >,
-        bitrange_bits: usize,
+        bits_start: u64,
+        bits_end: u64,
         value_bytes: usize,
         output_bytes: usize,
     ) -> llil::Expression<
@@ -944,19 +976,22 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
         llil::NonSSA<llil::LiftedNonSSA>,
         llil::ValueExpr,
     > {
-        if bitrange_bits > 0 {
+        if bits_start > 0 {
             expr = il
                 .lsr(
                     value_bytes,
                     expr,
-                    self.const_from_int(il, u64::try_from(bitrange_bits).unwrap().into(), 4),
+                    self.const_from_int(il, bits_start.into(), 4),
                 )
                 .build();
         }
 
-        let mask = usize::MAX >> (usize::BITS - u32::try_from(bitrange_bits).unwrap());
-        let mask = self.const_from_int(il, u64::try_from(mask).unwrap().into(), value_bytes);
-        expr = il.and(value_bytes, expr, mask).build();
+        let bitrange_bits = bits_end - bits_start;
+        if bitrange_bits != u64::try_from(value_bytes * 8).unwrap() {
+            let mask = usize::MAX >> (usize::BITS - u32::try_from(bitrange_bits).unwrap());
+            let mask = self.const_from_int(il, u64::try_from(mask).unwrap().into(), value_bytes);
+            expr = il.and(value_bytes, expr, mask).build();
+        }
 
         if output_bytes != value_bytes {
             expr = il.low_part(output_bytes, expr).build();
@@ -964,4 +999,83 @@ impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
 
         expr
     }
+}
+
+fn cut_bits<'a>(
+    lifted_expr: llil::Expression<
+        'a,
+        SleighArch,
+        llil::Mutable,
+        llil::NonSSA<llil::LiftedNonSSA>,
+        llil::ValueExpr,
+    >,
+    il: &'a binaryninja::llil::Function<
+        SleighArch,
+        llil::Mutable,
+        llil::NonSSA<binaryninja::llil::LiftedNonSSA>,
+    >,
+    bits: usize,
+    bytes: usize,
+) -> llil::Expression<
+    'a,
+    SleighArch,
+    llil::Mutable,
+    llil::NonSSA<llil::LiftedNonSSA>,
+    llil::ValueExpr,
+> {
+    assert!(bytes * 8 >= bits);
+    // if correct size, just return the expr
+    if bytes * 8 == bits {
+        return lifted_expr;
+    }
+
+    let mask = il.const_int(
+        bytes,
+        u64::MAX >> (u64::BITS - u32::try_from(bits).unwrap()),
+    );
+    il.and(bytes, lifted_expr, mask).build()
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "C" fn CorePluginInit() -> bool {
+    let handle = binaryninja::architecture::register_architecture("sleigh-sparc32", arch_builder);
+
+    if let Ok(bvt) = BinaryViewType::by_name("ELF") {
+        let endian = if handle.sleigh.endian().is_big() {
+            binaryninja::Endianness::BigEndian
+        } else {
+            binaryninja::Endianness::LittleEndian
+        };
+        bvt.register_arch(2, endian, handle);
+    }
+
+    true
+}
+
+fn arch_builder(
+    handle: CustomArchitectureHandle<SleighArch>,
+    core: CoreArchitecture,
+) -> SleighArch {
+    const SLEIGH_FILE: &str = "Ghidra/Processors/Sparc/data/languages/SparcV9_32.slaspec";
+
+    let home = std::env::var("GHIDRA_SRC").expect("Enviroment variable GHIDRA_SRC not found");
+    let path = format!("{home}/{SLEIGH_FILE}");
+    let sleigh = match sleigh_rs::file_to_sleigh(Path::new(&path)) {
+        Ok(data) => data,
+        Err(e) => panic!("Error: {e}"),
+    };
+    let default_context = new_default_context(&sleigh);
+    SleighArch {
+        default_context,
+        sleigh: Box::leak(Box::new(sleigh)),
+        core,
+        handle,
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "C" fn CorePluginDependencies() {
+    add_optional_plugin_dependency("view_elf");
 }
