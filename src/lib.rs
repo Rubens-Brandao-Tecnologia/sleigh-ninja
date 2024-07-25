@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use binaryninja::architecture::{
-    Architecture, CoreArchitecture, CustomArchitectureHandle, Flag, FlagClass, FlagCondition,
-    FlagGroup, FlagRole, FlagWrite, ImplicitRegisterExtend, InstructionInfo, Intrinsic, Register,
-    RegisterInfo, RegisterStack, RegisterStackInfo,
+    Architecture, BranchInfo, CoreArchitecture, CustomArchitectureHandle, Flag, FlagClass,
+    FlagCondition, FlagGroup, FlagRole, FlagWrite, ImplicitRegisterExtend, InstructionInfo,
+    Intrinsic, Register, RegisterInfo, RegisterStack, RegisterStackInfo,
 };
 use binaryninja::custombinaryview::{BinaryViewType, BinaryViewTypeExt};
 use binaryninja::disassembly::{InstructionTextToken, InstructionTextTokenContents};
@@ -14,8 +14,10 @@ use binaryninja::types::{Conf, NameAndType, Type};
 use binaryninja::Endianness;
 use binaryninja::{add_optional_plugin_dependency, llil};
 
+use log::{info, LevelFilter};
 use sleigh_eval::sleigh_rs::{NumberNonZeroUnsigned, Sleigh, VarnodeId};
 use sleigh_eval::*;
+use sleigh_rs::execution::BranchCall;
 use sleigh_rs::BitrangeId;
 
 #[derive(Clone)]
@@ -134,13 +136,82 @@ impl Architecture for SleighArch {
     }
 
     fn instruction_info(&self, data: &[u8], addr: u64) -> Option<InstructionInfo> {
+        info!("instruction_info {addr:#08x}");
         let instruction =
             match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
         let execution = sleigh_eval::to_execution_instruction(&self.sleigh, addr, &instruction)?;
-        Some(InstructionInfo::new(
+        let mut result = InstructionInfo::new(
             instruction.constructor.len,
             execution.delay_slot.try_into().unwrap(),
-        ))
+        );
+        let branches = execution
+            .blocks
+            .iter()
+            .flat_map(|block| block.statements.iter())
+            .filter_map(|st| match st {
+                Statement::CpuBranch(br) => Some(br),
+                Statement::LocalGoto(_) | Statement::UserCall(_) | Statement::Assignment(_) => None,
+            });
+        for branch in branches {
+            match branch {
+                CpuBranch {
+                    cond: None,
+                    call: BranchCall::Return,
+                    ..
+                } => {
+                    result.add_branch(BranchInfo::FunctionReturn, None);
+                }
+                CpuBranch {
+                    cond: None,
+                    call: BranchCall::Call,
+                    dst:
+                        Expr::Value(ExprElement::Value(ExprValue::Int {
+                            len_bits: _,
+                            number,
+                        })),
+                    ..
+                } => {
+                    result.add_branch(BranchInfo::Call(number.as_unsigned().unwrap()), None);
+                }
+                CpuBranch {
+                    cond: None,
+                    dst:
+                        Expr::Value(ExprElement::Value(ExprValue::Int {
+                            len_bits: _,
+                            number,
+                        })),
+                    ..
+                } => {
+                    result.add_branch(
+                        BranchInfo::Unconditional(number.as_unsigned().unwrap()),
+                        None,
+                    );
+                }
+                CpuBranch {
+                    cond: Some(_),
+                    dst:
+                        Expr::Value(ExprElement::Value(ExprValue::Int {
+                            len_bits: _,
+                            number,
+                        })),
+                    ..
+                } => {
+                    result.add_branch(BranchInfo::True(number.as_unsigned().unwrap()), None);
+                    result.add_branch(
+                        BranchInfo::False(
+                            addr.wrapping_sub(instruction.constructor.len.try_into().unwrap()),
+                        ),
+                        None,
+                    );
+                }
+                CpuBranch { .. } => {
+                    // TODO: this will crash the binary ninja because it will try to read a register
+                    // with an invalid id, seems like the id is garbage
+                    //result.add_branch(BranchInfo::Indirect, None);
+                }
+            }
+        }
+        Some(result)
     }
 
     fn instruction_text(
@@ -148,6 +219,7 @@ impl Architecture for SleighArch {
         data: &[u8],
         addr: u64,
     ) -> Option<(usize, Vec<InstructionTextToken>)> {
+        info!("instruction_text: {addr:#08x}");
         let instruction =
             match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
         // TODO convert the display segment directly into InstructionTextTokenContents
@@ -162,6 +234,7 @@ impl Architecture for SleighArch {
         addr: u64,
         il: &mut llil::Lifter<Self>,
     ) -> Option<(usize, bool)> {
+        info!("instruction_llil: {addr:#08x}");
         let instruction =
             match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
         let execution = sleigh_eval::to_execution_instruction(&self.sleigh, addr, &instruction)?;
@@ -177,6 +250,7 @@ impl Architecture for SleighArch {
             match instr {
                 Statement::CpuBranch(branch) => {
                     let dst = ExecutionContext {
+                        addr,
                         sleigh: &self.sleigh,
                         execution: &execution,
                         expr: &branch.dst,
@@ -188,19 +262,31 @@ impl Architecture for SleighArch {
                     };
                     if let Some(cond) = &branch.cond {
                         let cond = ExecutionContext {
+                            addr,
                             sleigh: &self.sleigh,
                             execution: &execution,
                             expr: cond,
                         };
-                        assert!(il.label_for_address(addr).is_none());
-                        let next_insts = addr + u64::try_from(instruction.constructor.len).unwrap();
-                        assert!(il.label_for_address(next_insts).is_none());
-                        let mut tl = llil::Label::default();
-                        il.mark_label(&mut tl);
-                        add_call();
-                        let mut fl = llil::Label::default();
-                        il.if_expr(cond, &tl, &fl).append();
-                        il.mark_label(&mut fl);
+                        let next_insts =
+                            addr.wrapping_add(u64::try_from(instruction.constructor.len).unwrap());
+                        let jmp_old_label = il.label_for_address(addr);
+                        let skp_old_label = il.label_for_address(next_insts);
+                        let mut jmp_new_label =
+                            jmp_old_label.is_none().then(|| llil::Label::default());
+                        let mut skp_new_label =
+                            skp_old_label.is_none().then(|| llil::Label::default());
+                        let jmp_label = jmp_old_label.or(jmp_new_label.as_ref()).unwrap();
+                        let skp_label = skp_old_label.or(skp_new_label.as_ref()).unwrap();
+                        il.if_expr(cond, &jmp_label, &skp_label).append();
+
+                        if let Some(jmp_new_label) = jmp_new_label.as_mut() {
+                            il.mark_label(jmp_new_label);
+                            add_call();
+                        }
+
+                        if let Some(skp_new_label) = skp_new_label.as_mut() {
+                            il.mark_label(skp_new_label);
+                        }
                     } else {
                         add_call()
                     }
@@ -216,6 +302,7 @@ impl Architecture for SleighArch {
                             id: call.function,
                         },
                         call.params.iter().map(|p| ExecutionContext {
+                            addr,
                             sleigh: &self.sleigh,
                             execution: &execution,
                             expr: p,
@@ -225,22 +312,23 @@ impl Architecture for SleighArch {
                 }
                 Statement::Assignment(ass) => {
                     let expr = ExecutionContext {
+                        addr,
                         sleigh: &self.sleigh,
                         execution: &execution,
                         expr: &ass.right,
                     };
-                    match ass.var {
+                    match &ass.var {
                         WriteValue::Varnode(varnode_id) => {
-                            let varnode = self.sleigh.varnode(varnode_id);
+                            let varnode = self.sleigh.varnode(*varnode_id);
                             il.set_reg(
                                 varnode.len_bytes.get().try_into().unwrap(),
-                                SleighRegister::from_sleigh(self.sleigh, varnode_id),
+                                SleighRegister::from_sleigh(self.sleigh, *varnode_id),
                                 expr,
                             )
                             .append();
                         }
                         WriteValue::Variable(variable_id) => {
-                            let varnode = execution.variable(variable_id);
+                            let varnode = execution.variable(*variable_id);
                             il.set_reg(
                                 ((varnode.len_bits.get() + 7) / 8).try_into().unwrap(),
                                 llil::Register::Temp(variable_id.0.try_into().unwrap()),
@@ -251,7 +339,7 @@ impl Architecture for SleighArch {
                         WriteValue::Bitrange(bitrange_id) => {
                             // write only a few bits to the reg,
                             // eg: varnode = (varnode & !0x1111) | value;
-                            let bitrange = self.sleigh.bitrange(bitrange_id);
+                            let bitrange = self.sleigh.bitrange(*bitrange_id);
                             let varnode = self.sleigh.varnode(bitrange.varnode);
                             let varnode_len = varnode.len_bytes.get().try_into().unwrap();
                             let mask = (u64::MAX
@@ -279,28 +367,20 @@ impl Architecture for SleighArch {
                             )
                             .append();
                         }
+                        WriteValue::Memory { memory, addr } => {
+                            il.store(
+                                memory.len_bytes.get().try_into().unwrap(),
+                                expr.map(addr),
+                                expr,
+                            )
+                            .append();
+                        }
                     }
-                }
-                Statement::MemWrite(mem) => {
-                    il.store(
-                        mem.mem.len_bytes.get().try_into().unwrap(),
-                        ExecutionContext {
-                            sleigh: &self.sleigh,
-                            execution: &execution,
-                            expr: &mem.addr,
-                        },
-                        ExecutionContext {
-                            sleigh: &self.sleigh,
-                            execution: &execution,
-                            expr: &mem.right,
-                        },
-                    )
-                    .append();
                 }
             }
         }
         // TODO implement sleigh execution and disable the debug flag
-        Some((execution.delay_slot.try_into().unwrap(), true))
+        Some((instruction.constructor.len, true))
     }
 
     fn registers_all(&self) -> Vec<Self::Register> {
@@ -319,7 +399,9 @@ impl Architecture for SleighArch {
             .iter()
             .enumerate()
             .filter(|(_id, varnode)| varnode.space.0 == space_id)
-            .map(|(id, _varnode)| SleighRegister::from_sleigh(self.sleigh, VarnodeId(id)))
+            .map(|(id, _varnode)| {
+                SleighRegister::from_sleigh(self.sleigh, unsafe { VarnodeId::from_raw(id) })
+            })
             .collect()
     }
 
@@ -337,7 +419,10 @@ impl Architecture for SleighArch {
         if id >= 0x8000_0000 {
             return None;
         }
-        let id = VarnodeId(id.try_into().unwrap());
+        // NOTE make sure the id is valid, I don't want to spend any more times
+        // debugging my code to find out that is binja fault.
+        assert!(usize::try_from(id).unwrap() < self.sleigh.varnodes().len());
+        let id = unsafe { VarnodeId::from_raw(id.try_into().unwrap()) };
         Some(SleighRegister::from_sleigh(self.sleigh, id))
     }
 
@@ -354,7 +439,7 @@ impl AsRef<CoreArchitecture> for SleighArch {
 
 impl SleighRegister {
     fn from_sleigh(sleigh: &'static Sleigh, id: VarnodeId) -> Self {
-        assert!(id.0 < 0x8000_0000);
+        assert!(id.to_raw() < 0x8000_0000);
         SleighRegister { sleigh, id }
     }
 }
@@ -376,10 +461,10 @@ impl Register for SleighRegister {
     }
 
     fn id(&self) -> u32 {
-        if self.id.0 >= 0x8000_0000 {
+        if self.id.to_raw() >= 0x8000_0000 {
             panic!();
         }
-        self.id.0 as u32
+        self.id.to_raw() as u32
     }
 }
 
@@ -539,6 +624,7 @@ impl Intrinsic for SleighIntrinsic {
 
 #[derive(Clone, Copy)]
 struct ExecutionContext<'a, 'b, E> {
+    addr: u64,
     sleigh: &'static Sleigh,
     execution: &'b Execution,
     expr: &'a E,
@@ -547,9 +633,10 @@ struct ExecutionContext<'a, 'b, E> {
 impl<'a, 'b, E> ExecutionContext<'a, 'b, E> {
     pub fn map<N>(&self, expr: &'a N) -> ExecutionContext<'a, 'b, N> {
         ExecutionContext {
+            addr: self.addr,
             sleigh: self.sleigh,
             execution: self.execution,
-            expr: expr,
+            expr,
         }
     }
 }
@@ -711,13 +798,40 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                     TrunkLsb(trunk) => ctxt.trunk_lsb(il, expr, *trunk, size, bytes),
                     BitRange(bits) => ctxt.bitrange(il, expr, bits.start, bits.end, size, bytes),
                     Dereference(mem) => {
-                        // TODO check if it's named RAM
-                        if ctxt.sleigh.space(mem.space).space_type
-                            != sleigh_rs::space::SpaceType::Ram
-                        {
-                            todo!();
+                        match ctxt.sleigh.space(mem.space).space_type {
+                            // TODO check if it's named RAM?
+                            sleigh_rs::space::SpaceType::Ram => il.load(size, expr).build(),
+                            sleigh_rs::space::SpaceType::Register => {
+                                // try to find a varnode
+                                let Expr::Value(ExprElement::Value(ExprValue::Int {
+                                    len_bits: _,
+                                    number: addr,
+                                })) = &*expr_op.input
+                                else {
+                                    unimplemented!(
+                                        "Dynamic dereferencing a register is not implemented: {:?} at {:#08x}: {:?}",
+                                        &expr_op,
+                                        ctxt.addr,
+                                        ctxt.expr,
+                                    )
+                                };
+                                let varnode_id = ctxt
+                                    .sleigh
+                                    .varnodes()
+                                    .iter()
+                                    .position(|v| {
+                                        v.address == addr.as_unsigned().unwrap()
+                                            && usize::try_from(v.len_bytes.get()).unwrap() == bytes
+                                    })
+                                    .expect("Register can't be found");
+                                ctxt.read_varnode(
+                                    il,
+                                    unsafe { VarnodeId::from_raw(varnode_id) },
+                                    bytes,
+                                )
+                            }
+                            sleigh_rs::space::SpaceType::Rom => todo!(),
                         }
-                        il.load(size, expr).build()
                     }
                     // TODO logical negation and bit-negation?
                     Negation => il.not(size, expr).build(),
@@ -1039,6 +1153,7 @@ fn cut_bits<'a>(
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "C" fn CorePluginInit() -> bool {
+    binaryninja::logger::init(LevelFilter::Info).expect("Unable to initialize logger");
     let handle = binaryninja::architecture::register_architecture("sleigh-sparc32", arch_builder);
 
     if let Ok(bvt) = BinaryViewType::by_name("ELF") {

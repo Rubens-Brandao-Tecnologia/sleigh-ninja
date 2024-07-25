@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 binaryninja = { path = "../binaryninja-api/rust" }
+log = "*"
 sleigh-eval = { path = "../sleigh-eval" }
 # we don't need this directly, sleigh-eval exports this,
 # we just need to force the thread feature
@@ -19,4 +20,3 @@ crate-type = ["cdylib"]
 panic = "abort"
 lto = true
 debug = 1
-
