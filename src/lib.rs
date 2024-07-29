@@ -142,8 +142,9 @@ impl Architecture for SleighArch {
         let execution = sleigh_eval::to_execution_instruction(&self.sleigh, addr, &instruction)?;
         let mut result = InstructionInfo::new(
             instruction.constructor.len,
-            execution.delay_slot.try_into().unwrap(),
+            execution.delay_slot.unwrap_or(0).try_into().unwrap(),
         );
+        // TODO check GlobalSet too
         let branches = execution
             .blocks
             .iter()
@@ -368,12 +369,33 @@ impl Architecture for SleighArch {
                             .append();
                         }
                         WriteValue::Memory { memory, addr } => {
-                            il.store(
-                                memory.len_bytes.get().try_into().unwrap(),
-                                expr.map(addr),
-                                expr,
-                            )
-                            .append();
+                            match self.sleigh.space(memory.space).space_type {
+                                sleigh_rs::space::SpaceType::Rom => panic!("Can't write to ROM"),
+                                sleigh_rs::space::SpaceType::Ram => {
+                                    il.store(
+                                        memory.len_bytes.get().try_into().unwrap(),
+                                        expr.map(addr),
+                                        expr,
+                                    )
+                                    .append();
+                                }
+                                sleigh_rs::space::SpaceType::Register => {
+                                    let varnode_id = try_find_varnode_from_deref_addr(
+                                        self.sleigh,
+                                        addr,
+                                        memory.len_bytes.get().try_into().unwrap(),
+                                    )
+                                    .unwrap();
+                                    let varnode = self.sleigh.varnode(varnode_id);
+                                    let varnode_len = varnode.len_bytes.get().try_into().unwrap();
+                                    il.set_reg(
+                                        varnode_len,
+                                        SleighRegister::from_sleigh(self.sleigh, varnode_id),
+                                        expr,
+                                    )
+                                    .append();
+                                }
+                            }
                         }
                     }
                 }
@@ -421,7 +443,12 @@ impl Architecture for SleighArch {
         }
         // NOTE make sure the id is valid, I don't want to spend any more times
         // debugging my code to find out that is binja fault.
-        assert!(usize::try_from(id).unwrap() < self.sleigh.varnodes().len());
+        assert!(
+            usize::try_from(id).unwrap() < self.sleigh.varnodes().len(),
+            "invalid register ID: {}, max {}",
+            id,
+            self.sleigh.varnodes().len(),
+        );
         let id = unsafe { VarnodeId::from_raw(id.try_into().unwrap()) };
         Some(SleighRegister::from_sleigh(self.sleigh, id))
     }
@@ -803,32 +830,13 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
                             sleigh_rs::space::SpaceType::Ram => il.load(size, expr).build(),
                             sleigh_rs::space::SpaceType::Register => {
                                 // try to find a varnode
-                                let Expr::Value(ExprElement::Value(ExprValue::Int {
-                                    len_bits: _,
-                                    number: addr,
-                                })) = &*expr_op.input
-                                else {
-                                    unimplemented!(
-                                        "Dynamic dereferencing a register is not implemented: {:?} at {:#08x}: {:?}",
-                                        &expr_op,
-                                        ctxt.addr,
-                                        ctxt.expr,
-                                    )
-                                };
-                                let varnode_id = ctxt
-                                    .sleigh
-                                    .varnodes()
-                                    .iter()
-                                    .position(|v| {
-                                        v.address == addr.as_unsigned().unwrap()
-                                            && usize::try_from(v.len_bytes.get()).unwrap() == bytes
-                                    })
-                                    .expect("Register can't be found");
-                                ctxt.read_varnode(
-                                    il,
-                                    unsafe { VarnodeId::from_raw(varnode_id) },
+                                let varnode_id = try_find_varnode_from_deref_addr(
+                                    ctxt.sleigh,
+                                    &expr_op.input,
                                     bytes,
                                 )
+                                .expect("Unable to translate dereference into varnode");
+                                ctxt.read_varnode(il, varnode_id, bytes)
                             }
                             sleigh_rs::space::SpaceType::Rom => todo!(),
                         }
@@ -861,6 +869,27 @@ impl<'a, 'b> llil::LiftableWithSize<'a, SleighArch> for ExecutionContext<'a, 'b,
             }
         }
     }
+}
+
+fn try_find_varnode_from_deref_addr(
+    sleigh: &Sleigh,
+    expr: &Expr,
+    bytes: usize,
+) -> Result<VarnodeId, String> {
+    let Expr::Value(ExprElement::Value(ExprValue::Int {
+        len_bits: _,
+        number: addr,
+    })) = expr
+    else {
+        return Err(format!("Complex expr {:?}", expr));
+    };
+    let addr = addr.as_unsigned().unwrap();
+    let varnode_id = sleigh
+        .varnodes()
+        .iter()
+        .position(|v| v.address == addr && usize::try_from(v.len_bytes.get()).unwrap() == bytes)
+        .ok_or_else(|| format!("Can't find Register at {:#x} len {:#x}", addr, bytes))?;
+    Ok(unsafe { VarnodeId::from_raw(varnode_id) })
 }
 
 impl<'a, 'b> llil::Liftable<'a, SleighArch> for ExecutionContext<'a, 'b, ExprValue> {
