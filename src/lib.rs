@@ -224,9 +224,60 @@ impl Architecture for SleighArch {
         let instruction =
             match_instruction(&self.sleigh, self.default_context.clone(), addr, data)?;
         // TODO convert the display segment directly into InstructionTextTokenContents
-        let disassembly = to_string_instruction(&self.sleigh, addr, &instruction);
-        let output = InstructionTextToken::new(&disassembly, InstructionTextTokenContents::Text);
-        Some((instruction.constructor.len, vec![output]))
+        let display = to_instruction_tokens(&self.sleigh, addr, &instruction);
+        let mut output = Vec::with_capacity(
+            display.elements.len() + display.mneumonic.is_some().then_some(1).unwrap_or(0),
+        );
+        if let Some(mneumonic) = &display.mneumonic {
+            output.push(InstructionTextToken::new(
+                &mneumonic,
+                InstructionTextTokenContents::Instruction,
+            ));
+        }
+        for element in &display.elements {
+            match element {
+                sleigh_eval::DisplayElement::Separator => {
+                    output.push(InstructionTextToken::new(
+                        " ",
+                        InstructionTextTokenContents::OperandSeparator,
+                    ));
+                }
+                sleigh_eval::DisplayElement::Literal(lit) => {
+                    output.push(InstructionTextToken::new(
+                        lit.as_str(),
+                        InstructionTextTokenContents::Keyword,
+                    ));
+                }
+                sleigh_eval::DisplayElement::Varnode(varnode_id) => {
+                    let register = self.sleigh.varnode(*varnode_id);
+                    output.push(InstructionTextToken::new(
+                        register.name(),
+                        InstructionTextTokenContents::Register,
+                    ));
+                }
+                sleigh_eval::DisplayElement::Number(value, base) => match base {
+                    sleigh_rs::PrintBase::Dec => {
+                        output.push(InstructionTextToken::new(
+                            &format!("{value}"),
+                            InstructionTextTokenContents::Integer(*value as u64),
+                        ));
+                    }
+                    sleigh_rs::PrintBase::Hex => {
+                        output.push(InstructionTextToken::new(
+                            &format!("{value:#x}"),
+                            InstructionTextTokenContents::Integer(*value as u64),
+                        ));
+                    }
+                },
+                sleigh_eval::DisplayElement::Address(addr) => {
+                    output.push(InstructionTextToken::new(
+                        &format!("{addr:#x}"),
+                        InstructionTextTokenContents::PossibleAddress(*addr as u64),
+                    ));
+                }
+            }
+        }
+        Some((instruction.constructor.len, output))
     }
 
     fn instruction_llil(
@@ -443,12 +494,13 @@ impl Architecture for SleighArch {
         }
         // NOTE make sure the id is valid, I don't want to spend any more times
         // debugging my code to find out that is binja fault.
-        assert!(
-            usize::try_from(id).unwrap() < self.sleigh.varnodes().len(),
-            "invalid register ID: {}, max {}",
-            id,
-            self.sleigh.varnodes().len(),
-        );
+        if usize::try_from(id).unwrap() >= self.sleigh.varnodes().len() {
+            panic!(
+                "invalid register ID: {}, max {}",
+                id,
+                self.sleigh.varnodes().len(),
+            );
+        }
         let id = unsafe { VarnodeId::from_raw(id.try_into().unwrap()) };
         Some(SleighRegister::from_sleigh(self.sleigh, id))
     }
